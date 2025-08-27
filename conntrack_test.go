@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"runtime"
 	"testing"
 	"time"
@@ -44,6 +45,68 @@ func udpFlowCreateProg(t *testing.T, flows, srcPort int, dstIP string, dstPort i
 	}
 }
 
+// Install minimal hooks so packets traverse conntrack in this netns.
+// Prefer iptables if available; otherwise use nftables.
+// Returns a cleanup function that removes the installed hooks.
+func ensureCtHooksInThisNS(t *testing.T) func() {
+	t.Helper()
+
+	// Prefer iptables if present
+	if _, err := exec.LookPath("iptables"); err == nil {
+		ipt := func(fatalOnErr bool, args ...string) error {
+			cmd := exec.Command("iptables", args...)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				if fatalOnErr {
+					t.Fatalf("iptables %v failed: %v\n%s", args, err, out)
+				}
+				// For -C, non-zero exit is expected when rule doesn't exist.
+				// For -D, we don't want to fail the test on cleanup.
+				t.Logf("iptables %v -> non-fatal error (ok): %v\n%s", args, err, out)
+			}
+			return err
+		}
+
+		// Minimal hooks so packets traverse conntrack in this netns.
+		// Check (-C); if absent, insert (-I). Idempotent on reruns.
+		var addedInput, addedOutput bool
+		if ipt(false, "-C", "INPUT", "-m", "conntrack", "--ctstate", "NEW,ESTABLISHED", "-j", "ACCEPT") != nil {
+			ipt(true, "-I", "INPUT", "-m", "conntrack", "--ctstate", "NEW,ESTABLISHED", "-j", "ACCEPT")
+			addedInput = true
+		}
+		if ipt(false, "-C", "OUTPUT", "-m", "conntrack", "--ctstate", "ESTABLISHED", "-j", "ACCEPT") != nil {
+			ipt(true, "-I", "OUTPUT", "-m", "conntrack", "--ctstate", "ESTABLISHED", "-j", "ACCEPT")
+			addedOutput = true
+		}
+		return func() {
+			if addedInput {
+				ipt(false, "-D", "INPUT", "-m", "conntrack", "--ctstate", "NEW,ESTABLISHED", "-j", "ACCEPT")
+			}
+			if addedOutput {
+				ipt(false, "-D", "OUTPUT", "-m", "conntrack", "--ctstate", "ESTABLISHED", "-j", "ACCEPT")
+			}
+		}
+	}
+
+	// Fallback to nft if iptables isn’t available
+	if _, err := exec.LookPath("nft"); err == nil {
+		// Best-effort, ignore “already exists” errors to be idempotent
+		_ = exec.Command("nft", "add", "table", "inet", "ct_test").Run()
+		_ = exec.Command("nft", "add", "chain", "inet", "ct_test", "input",
+			"{", "type", "filter", "hook", "input", "priority", "0", ";",
+			"ct", "state", "{", "new,established", "}", "accept", "}").Run()
+		_ = exec.Command("nft", "add", "chain", "inet", "ct_test", "output",
+			"{", "type", "filter", "hook", "output", "priority", "0", ";",
+			"ct", "state", "established", "accept", "}").Run()
+		return func() {
+			_ = exec.Command("nft", "delete", "table", "inet", "ct_test").Run()
+		}
+	}
+
+	t.Skip("neither iptables nor nft found to install conntrack hooks")
+	return func() {}
+}
+
 func nsCreateAndEnter(t *testing.T) (*netns.NsHandle, *netns.NsHandle, *Handle) {
 	// Lock the OS Thread so we don't accidentally switch namespaces
 	runtime.LockOSThread()
@@ -63,6 +126,12 @@ func nsCreateAndEnter(t *testing.T) (*netns.NsHandle, *netns.NsHandle, *Handle) 
 	// Bing up loopback
 	link, _ := h.LinkByName("lo")
 	h.LinkSetUp(link)
+
+	setUpF(t, "/proc/sys/net/netfilter/nf_conntrack_acct", "1")
+	setUpF(t, "/proc/sys/net/netfilter/nf_conntrack_timestamp", "1")
+	setUpF(t, "/proc/sys/net/netfilter/nf_conntrack_udp_timeout", "45")
+
+	t.Cleanup(ensureCtHooksInThisNS(t))
 
 	return &origns, &ns, h
 }
@@ -96,9 +165,6 @@ func TestConntrackSocket(t *testing.T) {
 // TestConntrackTableList test the conntrack table list
 // Creates some flows and checks that they are correctly fetched from the conntrack table
 func TestConntrackTableList(t *testing.T) {
-	if os.Getenv("CI") == "true" {
-		t.Skipf("Fails in CI: Flow creation fails")
-	}
 	skipUnlessRoot(t)
 	k, m, err := KernelVersion()
 	if err != nil {
@@ -119,10 +185,6 @@ func TestConntrackTableList(t *testing.T) {
 	defer origns.Close()
 	defer ns.Close()
 	defer runtime.UnlockOSThread()
-
-	setUpF(t, "/proc/sys/net/netfilter/nf_conntrack_acct", "1")
-	setUpF(t, "/proc/sys/net/netfilter/nf_conntrack_timestamp", "1")
-	setUpF(t, "/proc/sys/net/netfilter/nf_conntrack_udp_timeout", "45")
 
 	// Flush the table to start fresh
 	err = h.ConntrackTableFlush(ConntrackTable)
@@ -176,9 +238,6 @@ func TestConntrackTableList(t *testing.T) {
 // TestConntrackTableFlush test the conntrack table flushing
 // Creates some flows and then call the table flush
 func TestConntrackTableFlush(t *testing.T) {
-	if os.Getenv("CI") == "true" {
-		t.Skipf("Fails in CI: Flow creation fails")
-	}
 	skipUnlessRoot(t)
 	setUpNetlinkTestWithKModule(t, "nf_conntrack")
 	setUpNetlinkTestWithKModule(t, "nf_conntrack_netlink")
@@ -249,9 +308,6 @@ func TestConntrackTableFlush(t *testing.T) {
 // TestConntrackTableDelete tests the deletion with filter
 // Creates 2 group of flows then deletes only one group and validates the result
 func TestConntrackTableDelete(t *testing.T) {
-	if os.Getenv("CI") == "true" {
-		t.Skipf("Fails in CI: Flow creation fails")
-	}
 	skipUnlessRoot(t)
 
 	requiredModules := []string{"nf_conntrack", "nf_conntrack_netlink"}
@@ -350,22 +406,22 @@ func TestConntrackTableDelete(t *testing.T) {
 func TestConntrackFilter(t *testing.T) {
 	var flowList []ConntrackFlow
 	flowList = append(flowList, ConntrackFlow{
-			FamilyType: unix.AF_INET,
-			Forward: IPTuple{
-				SrcIP:    net.ParseIP("10.0.0.1"),
-				DstIP:    net.ParseIP("20.0.0.1"),
-				SrcPort:  1000,
-				DstPort:  2000,
-				Protocol: 17,
-			},
-			Reverse: IPTuple{
-				SrcIP:    net.ParseIP("20.0.0.1"),
-				DstIP:    net.ParseIP("192.168.1.1"),
-				SrcPort:  2000,
-				DstPort:  1000,
-				Protocol: 17,
-			},
+		FamilyType: unix.AF_INET,
+		Forward: IPTuple{
+			SrcIP:    net.ParseIP("10.0.0.1"),
+			DstIP:    net.ParseIP("20.0.0.1"),
+			SrcPort:  1000,
+			DstPort:  2000,
+			Protocol: 17,
 		},
+		Reverse: IPTuple{
+			SrcIP:    net.ParseIP("20.0.0.1"),
+			DstIP:    net.ParseIP("192.168.1.1"),
+			SrcPort:  2000,
+			DstPort:  1000,
+			Protocol: 17,
+		},
+	},
 		ConntrackFlow{
 			FamilyType: unix.AF_INET,
 			Forward: IPTuple{
@@ -1015,23 +1071,23 @@ func TestConntrackUpdateV4(t *testing.T) {
 	flow := ConntrackFlow{
 		FamilyType: FAMILY_V4,
 		Forward: IPTuple{
-			SrcIP: net.IP{234,234,234,234},
-			DstIP: net.IP{123,123,123,123},
-			SrcPort: 48385,
-			DstPort: 53,
+			SrcIP:    net.IP{234, 234, 234, 234},
+			DstIP:    net.IP{123, 123, 123, 123},
+			SrcPort:  48385,
+			DstPort:  53,
 			Protocol: unix.IPPROTO_TCP,
 		},
 		Reverse: IPTuple{
-			SrcIP: net.IP{123,123,123,123},
-			DstIP: net.IP{234,234,234,234},
-			SrcPort: 53,
-			DstPort: 48385,
+			SrcIP:    net.IP{123, 123, 123, 123},
+			DstIP:    net.IP{234, 234, 234, 234},
+			SrcPort:  53,
+			DstPort:  48385,
 			Protocol: unix.IPPROTO_TCP,
 		},
 		// No point checking equivalence of timeout, but value must
 		// be reasonable to allow for a potentially slow subsequent read.
-		TimeOut:   100,
-		Mark: 12,
+		TimeOut: 100,
+		Mark:    12,
 		ProtoInfo: &ProtoInfoTCP{
 			State: nl.TCP_CONNTRACK_SYN_SENT2,
 		},
@@ -1054,8 +1110,8 @@ func TestConntrackUpdateV4(t *testing.T) {
 
 	filter := ConntrackFilter{
 		ipNetFilter: map[ConntrackFilterType]*net.IPNet{
-			ConntrackOrigSrcIP: NewIPNet(flow.Forward.SrcIP),
-			ConntrackOrigDstIP: NewIPNet(flow.Forward.DstIP),
+			ConntrackOrigSrcIP:  NewIPNet(flow.Forward.SrcIP),
+			ConntrackOrigDstIP:  NewIPNet(flow.Forward.DstIP),
 			ConntrackReplySrcIP: NewIPNet(flow.Reverse.SrcIP),
 			ConntrackReplyDstIP: NewIPNet(flow.Reverse.DstIP),
 		},
@@ -1063,7 +1119,7 @@ func TestConntrackUpdateV4(t *testing.T) {
 			ConntrackOrigSrcPort: flow.Forward.SrcPort,
 			ConntrackOrigDstPort: flow.Forward.DstPort,
 		},
-		protoFilter:unix.IPPROTO_TCP,
+		protoFilter: unix.IPPROTO_TCP,
 	}
 
 	var match *ConntrackFlow
@@ -1148,23 +1204,23 @@ func TestConntrackUpdateV6(t *testing.T) {
 	flow := ConntrackFlow{
 		FamilyType: FAMILY_V6,
 		Forward: IPTuple{
-			SrcIP: net.ParseIP("2001:db8::68"),
-			DstIP: net.ParseIP("2001:db9::32"),
-			SrcPort: 48385,
-			DstPort: 53,
+			SrcIP:    net.ParseIP("2001:db8::68"),
+			DstIP:    net.ParseIP("2001:db9::32"),
+			SrcPort:  48385,
+			DstPort:  53,
 			Protocol: unix.IPPROTO_TCP,
 		},
 		Reverse: IPTuple{
-			SrcIP: net.ParseIP("2001:db9::32"),
-			DstIP: net.ParseIP("2001:db8::68"),
-			SrcPort: 53,
-			DstPort: 48385,
+			SrcIP:    net.ParseIP("2001:db9::32"),
+			DstIP:    net.ParseIP("2001:db8::68"),
+			SrcPort:  53,
+			DstPort:  48385,
 			Protocol: unix.IPPROTO_TCP,
 		},
 		// No point checking equivalence of timeout, but value must
 		// be reasonable to allow for a potentially slow subsequent read.
-		TimeOut:   100,
-		Mark: 12,
+		TimeOut: 100,
+		Mark:    12,
 		ProtoInfo: &ProtoInfoTCP{
 			State: nl.TCP_CONNTRACK_SYN_SENT2,
 		},
@@ -1187,8 +1243,8 @@ func TestConntrackUpdateV6(t *testing.T) {
 
 	filter := ConntrackFilter{
 		ipNetFilter: map[ConntrackFilterType]*net.IPNet{
-			ConntrackOrigSrcIP: NewIPNet(flow.Forward.SrcIP),
-			ConntrackOrigDstIP: NewIPNet(flow.Forward.DstIP),
+			ConntrackOrigSrcIP:  NewIPNet(flow.Forward.SrcIP),
+			ConntrackOrigDstIP:  NewIPNet(flow.Forward.DstIP),
 			ConntrackReplySrcIP: NewIPNet(flow.Reverse.SrcIP),
 			ConntrackReplyDstIP: NewIPNet(flow.Reverse.DstIP),
 		},
@@ -1196,7 +1252,7 @@ func TestConntrackUpdateV6(t *testing.T) {
 			ConntrackOrigSrcPort: flow.Forward.SrcPort,
 			ConntrackOrigDstPort: flow.Forward.DstPort,
 		},
-		protoFilter:unix.IPPROTO_TCP,
+		protoFilter: unix.IPPROTO_TCP,
 	}
 
 	var match *ConntrackFlow
@@ -1279,23 +1335,23 @@ func TestConntrackCreateV4(t *testing.T) {
 	flow := ConntrackFlow{
 		FamilyType: FAMILY_V4,
 		Forward: IPTuple{
-			SrcIP: net.IP{234,234,234,234},
-			DstIP: net.IP{123,123,123,123},
-			SrcPort: 48385,
-			DstPort: 53,
+			SrcIP:    net.IP{234, 234, 234, 234},
+			DstIP:    net.IP{123, 123, 123, 123},
+			SrcPort:  48385,
+			DstPort:  53,
 			Protocol: unix.IPPROTO_TCP,
 		},
 		Reverse: IPTuple{
-			SrcIP: net.IP{123,123,123,123},
-			DstIP: net.IP{234,234,234,234},
-			SrcPort: 53,
-			DstPort: 48385,
+			SrcIP:    net.IP{123, 123, 123, 123},
+			DstIP:    net.IP{234, 234, 234, 234},
+			SrcPort:  53,
+			DstPort:  48385,
 			Protocol: unix.IPPROTO_TCP,
 		},
 		// No point checking equivalence of timeout, but value must
 		// be reasonable to allow for a potentially slow subsequent read.
-		TimeOut:   100,
-		Mark: 12,
+		TimeOut: 100,
+		Mark:    12,
 		ProtoInfo: &ProtoInfoTCP{
 			State: nl.TCP_CONNTRACK_ESTABLISHED,
 		},
@@ -1313,8 +1369,8 @@ func TestConntrackCreateV4(t *testing.T) {
 
 	filter := ConntrackFilter{
 		ipNetFilter: map[ConntrackFilterType]*net.IPNet{
-			ConntrackOrigSrcIP: NewIPNet(flow.Forward.SrcIP),
-			ConntrackOrigDstIP: NewIPNet(flow.Forward.DstIP),
+			ConntrackOrigSrcIP:  NewIPNet(flow.Forward.SrcIP),
+			ConntrackOrigDstIP:  NewIPNet(flow.Forward.DstIP),
 			ConntrackReplySrcIP: NewIPNet(flow.Reverse.SrcIP),
 			ConntrackReplyDstIP: NewIPNet(flow.Reverse.DstIP),
 		},
@@ -1322,7 +1378,7 @@ func TestConntrackCreateV4(t *testing.T) {
 			ConntrackOrigSrcPort: flow.Forward.SrcPort,
 			ConntrackOrigDstPort: flow.Forward.DstPort,
 		},
-		protoFilter:unix.IPPROTO_TCP,
+		protoFilter: unix.IPPROTO_TCP,
 	}
 
 	var match *ConntrackFlow
@@ -1374,23 +1430,23 @@ func TestConntrackCreateV6(t *testing.T) {
 	flow := ConntrackFlow{
 		FamilyType: FAMILY_V6,
 		Forward: IPTuple{
-			SrcIP: net.ParseIP("2001:db8::68"),
-			DstIP: net.ParseIP("2001:db9::32"),
-			SrcPort: 48385,
-			DstPort: 53,
+			SrcIP:    net.ParseIP("2001:db8::68"),
+			DstIP:    net.ParseIP("2001:db9::32"),
+			SrcPort:  48385,
+			DstPort:  53,
 			Protocol: unix.IPPROTO_TCP,
 		},
 		Reverse: IPTuple{
-			SrcIP: net.ParseIP("2001:db9::32"),
-			DstIP: net.ParseIP("2001:db8::68"),
-			SrcPort: 53,
-			DstPort: 48385,
+			SrcIP:    net.ParseIP("2001:db9::32"),
+			DstIP:    net.ParseIP("2001:db8::68"),
+			SrcPort:  53,
+			DstPort:  48385,
 			Protocol: unix.IPPROTO_TCP,
 		},
 		// No point checking equivalence of timeout, but value must
 		// be reasonable to allow for a potentially slow subsequent read.
-		TimeOut:    100,
-		Mark: 12,
+		TimeOut: 100,
+		Mark:    12,
 		ProtoInfo: &ProtoInfoTCP{
 			State: nl.TCP_CONNTRACK_ESTABLISHED,
 		},
@@ -1408,8 +1464,8 @@ func TestConntrackCreateV6(t *testing.T) {
 
 	filter := ConntrackFilter{
 		ipNetFilter: map[ConntrackFilterType]*net.IPNet{
-			ConntrackOrigSrcIP: NewIPNet(flow.Forward.SrcIP),
-			ConntrackOrigDstIP: NewIPNet(flow.Forward.DstIP),
+			ConntrackOrigSrcIP:  NewIPNet(flow.Forward.SrcIP),
+			ConntrackOrigDstIP:  NewIPNet(flow.Forward.DstIP),
 			ConntrackReplySrcIP: NewIPNet(flow.Reverse.SrcIP),
 			ConntrackReplyDstIP: NewIPNet(flow.Reverse.DstIP),
 		},
@@ -1417,7 +1473,7 @@ func TestConntrackCreateV6(t *testing.T) {
 			ConntrackOrigSrcPort: flow.Forward.SrcPort,
 			ConntrackOrigDstPort: flow.Forward.DstPort,
 		},
-		protoFilter:unix.IPPROTO_TCP,
+		protoFilter: unix.IPPROTO_TCP,
 	}
 
 	var match *ConntrackFlow
@@ -1448,43 +1504,43 @@ func TestConntrackFlowToNlData(t *testing.T) {
 	flowV4 := ConntrackFlow{
 		FamilyType: FAMILY_V4,
 		Forward: IPTuple{
-			SrcIP: net.IP{234,234,234,234},
-			DstIP: net.IP{123,123,123,123},
-			SrcPort: 48385,
-			DstPort: 53,
+			SrcIP:    net.IP{234, 234, 234, 234},
+			DstIP:    net.IP{123, 123, 123, 123},
+			SrcPort:  48385,
+			DstPort:  53,
 			Protocol: unix.IPPROTO_TCP,
 		},
 		Reverse: IPTuple{
-			SrcIP: net.IP{123,123,123,123},
-			DstIP: net.IP{234,234,234,234},
-			SrcPort: 53,
-			DstPort: 48385,
+			SrcIP:    net.IP{123, 123, 123, 123},
+			DstIP:    net.IP{234, 234, 234, 234},
+			SrcPort:  53,
+			DstPort:  48385,
 			Protocol: unix.IPPROTO_TCP,
 		},
-		Mark: 5,
-		TimeOut:    10,
+		Mark:    5,
+		TimeOut: 10,
 		ProtoInfo: &ProtoInfoTCP{
 			State: nl.TCP_CONNTRACK_ESTABLISHED,
 		},
 	}
-	flowV6 := ConntrackFlow	{
+	flowV6 := ConntrackFlow{
 		FamilyType: FAMILY_V6,
 		Forward: IPTuple{
-				SrcIP: net.ParseIP("2001:db8::68"),
-				DstIP: net.ParseIP("2001:db9::32"),
-				SrcPort: 48385,
-				DstPort: 53,
-				Protocol: unix.IPPROTO_TCP,
-		},
-		Reverse: IPTuple{
-			SrcIP: net.ParseIP("2001:db9::32"),
-			DstIP: net.ParseIP("2001:db8::68"),
-			SrcPort: 53,
-			DstPort: 48385,
+			SrcIP:    net.ParseIP("2001:db8::68"),
+			DstIP:    net.ParseIP("2001:db9::32"),
+			SrcPort:  48385,
+			DstPort:  53,
 			Protocol: unix.IPPROTO_TCP,
 		},
-		Mark: 5,
-		TimeOut:    10,
+		Reverse: IPTuple{
+			SrcIP:    net.ParseIP("2001:db9::32"),
+			DstIP:    net.ParseIP("2001:db8::68"),
+			SrcPort:  53,
+			DstPort:  48385,
+			Protocol: unix.IPPROTO_TCP,
+		},
+		Mark:    5,
+		TimeOut: 10,
 		ProtoInfo: &ProtoInfoTCP{
 			State: nl.TCP_CONNTRACK_ESTABLISHED,
 		},
@@ -1497,7 +1553,7 @@ func TestConntrackFlowToNlData(t *testing.T) {
 		t.Fatalf("Error converting ConntrackFlow to netlink messages: %s", err)
 	}
 	// Mock nfgenmsg header
-	bytesV4 = append(bytesV4, flowV4.FamilyType,0,0,0)
+	bytesV4 = append(bytesV4, flowV4.FamilyType, 0, 0, 0)
 	for _, a := range attrsV4 {
 		bytesV4 = append(bytesV4, a.Serialize()...)
 	}
@@ -1507,7 +1563,7 @@ func TestConntrackFlowToNlData(t *testing.T) {
 		t.Fatalf("Error converting ConntrackFlow to netlink messages: %s", err)
 	}
 	// Mock nfgenmsg header
-	bytesV6 = append(bytesV6, flowV6.FamilyType,0,0,0)
+	bytesV6 = append(bytesV6, flowV6.FamilyType, 0, 0, 0)
 	for _, a := range attrsV6 {
 		bytesV6 = append(bytesV6, a.Serialize()...)
 	}
