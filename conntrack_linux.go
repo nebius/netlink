@@ -388,6 +388,8 @@ func (s *ConntrackFlow) toNlData() ([]*nl.RtAttr, error) {
 	//	<BEuint64>
 	//	<len, CTA_LABELS>
 	//	<binary data>
+	//	<len, CTA_ZONE>
+	//	<BEuint16>
 	//	<len, NLA_F_NESTED|CTA_PROTOINFO>
  
 	// CTA_TUPLE_ORIG
@@ -434,6 +436,11 @@ func (s *ConntrackFlow) toNlData() ([]*nl.RtAttr, error) {
 		default:
 			return nil, errors.New("couldn't generate netlink data for conntrack: field 'ProtoInfo' only supports TCP or nil")
 		}
+	}
+
+	if s.Zone != 0 {
+		ctZone := nl.NewRtAttr(nl.CTA_ZONE, nl.BEUint16Attr(s.Zone))
+		payload = append(payload, ctZone)
 	}
 
 	return payload, nil
