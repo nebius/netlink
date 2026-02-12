@@ -17,8 +17,17 @@ var pkgHandle = &Handle{}
 // same netlink family share the same netlink socket,
 // which gets released when the handle is Close'd.
 type Handle struct {
-	sockets      map[int]*nl.SocketHandle
-	lookupByDump bool
+	sockets          map[int]*nl.SocketHandle
+	lookupByDump     bool
+	retryInterrupted bool
+}
+
+// RetryInterrupted configures the Handle to automatically retry dump operations
+// a number of times if they fail with EINTR before finally returning
+// [ErrDumpInterrupted].
+func (h *Handle) RetryInterrupted() *Handle {
+	h.retryInterrupted = true
+	return h
 }
 
 // SetSocketTimeout configures timeout for default netlink sockets
@@ -179,5 +188,7 @@ func (h *Handle) newNetlinkRequest(proto, flags int) *nl.NetlinkRequest {
 			Flags: unix.NLM_F_REQUEST | uint16(flags),
 		},
 		Sockets: h.sockets,
+
+		RetryInterrupted: h.retryInterrupted,
 	}
 }
