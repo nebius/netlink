@@ -258,6 +258,75 @@ func TestConntrackTableList(t *testing.T) {
 	netns.Set(*origns)
 }
 
+// TestConntrackTableListByZone creates an IPv4 conntrack entry in a specific
+// zone and verifies that it is returned by a zone-filtered table dump.
+func TestConntrackTableListByZone(t *testing.T) {
+	requiredModules := []string{"nf_conntrack", "nf_conntrack_netlink"}
+	k, m, err := KernelVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Conntrack l3proto was unified since 4.19.
+	// https://github.com/torvalds/linux/commit/a0ae2562c6c4b2721d9fddba63b7286c13517d9f
+	if k < 4 || k == 4 && m < 19 {
+		requiredModules = append(requiredModules, "nf_conntrack_ipv4")
+	}
+
+	// Implicitly skips the test if not root.
+	nsStr, teardown := setUpNamedNetlinkTestWithKModule(t, requiredModules...)
+	t.Cleanup(teardown)
+
+	ns, err := netns.GetFromName(nsStr)
+	if err != nil {
+		t.Fatalf("couldn't get handle to generated namespace: %s", err)
+	}
+
+	h, err := NewHandleAt(ns, nl.FAMILY_V4)
+	if err != nil {
+		t.Fatalf("failed to create netlink handle: %s", err)
+	}
+
+	zone := uint16(1234)
+	flow := ConntrackFlow{
+		FamilyType: FAMILY_V4,
+		Forward: IPTuple{
+			SrcIP:    net.IP{234, 234, 234, 234},
+			DstIP:    net.IP{123, 123, 123, 123},
+			SrcPort:  48385,
+			DstPort:  53,
+			Protocol: unix.IPPROTO_TCP,
+		},
+		Reverse: IPTuple{
+			SrcIP:    net.IP{123, 123, 123, 123},
+			DstIP:    net.IP{234, 234, 234, 234},
+			SrcPort:  53,
+			DstPort:  48385,
+			Protocol: unix.IPPROTO_TCP,
+		},
+		TimeOut: 100,
+		Status:  ConntrackStatusConfirmed,
+		Mark:    12,
+		ProtoInfo: &ProtoInfoTCP{
+			State: nl.TCP_CONNTRACK_SYN_SENT2,
+		},
+		Zone: zone,
+	}
+
+	if err := h.ConntrackCreate(ConntrackTable, nl.FAMILY_V4, &flow); err != nil {
+		t.Fatalf("failed to insert conntrack in zone %d: %s", zone, err)
+	}
+
+	flows, err := h.ConntrackTableListByZone(ConntrackTable, zone)
+	if err != nil {
+		t.Fatalf("failed to list conntracks in zone %d: %s", zone, err)
+	}
+	if len(flows) != 1 {
+		t.Fatalf("got %d conntrack entries in zone %d, want 1", len(flows), zone)
+	}
+	checkFlowsEqual(t, &flow, flows[0])
+	checkProtoInfosEqual(t, flow.ProtoInfo, flows[0].ProtoInfo)
+}
+
 // TestConntrackTableFlush test the conntrack table flushing
 // Creates some flows and then call the table flush
 func TestConntrackTableFlush(t *testing.T) {
@@ -1999,6 +2068,10 @@ func checkFlowsEqual(t *testing.T, f1, f2 *ConntrackFlow) {
 	}
 	if f1.Mark != f2.Mark {
 		t.Logf("Conntrack flow Marks differ. Tuple1: %d, Tuple2: %d.\n", f1.Mark, f2.Mark)
+		t.Fail()
+	}
+	if f1.Zone != f2.Zone {
+		t.Logf("Conntrack flow Zones differ. Tuple1: %d, Tuple2: %d.\n", f1.Zone, f2.Zone)
 		t.Fail()
 	}
 	if !tuplesEqual(f1.Forward, f2.Forward) {

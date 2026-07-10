@@ -52,6 +52,15 @@ func ConntrackTableList(table ConntrackTableType, family InetFamily) ([]*Conntra
 	return pkgHandle.ConntrackTableList(table, family)
 }
 
+// ConntrackTableListByZone returns the flow list of the conntrack table for a
+// specific zone. Zone filtering is only supported for [ConntrackTable].
+//
+// If the returned error is [ErrDumpInterrupted], results may be inconsistent
+// or incomplete.
+func ConntrackTableListByZone(table ConntrackTableType, zone uint16) ([]*ConntrackFlow, error) {
+	return pkgHandle.ConntrackTableListByZone(table, zone)
+}
+
 // ConntrackTableFlush flushes all the flows of a specified table
 // conntrack -F [table]            Flush table
 // The flush operation applies to all the family types
@@ -98,6 +107,21 @@ func ConntrackDeleteFilters(table ConntrackTableType, family InetFamily, filters
 // or incomplete.
 func (h *Handle) ConntrackTableList(table ConntrackTableType, family InetFamily) ([]*ConntrackFlow, error) {
 	res, executeErr := h.dumpConntrackTable(table, family)
+	return parseConntrackTableList(res, executeErr)
+}
+
+// ConntrackTableListByZone returns the flow list of the conntrack table for a
+// specific zone using the netlink handle passed. Zone filtering is only
+// supported for [ConntrackTable].
+//
+// If the returned error is [ErrDumpInterrupted], results may be inconsistent
+// or incomplete.
+func (h *Handle) ConntrackTableListByZone(table ConntrackTableType, zone uint16) ([]*ConntrackFlow, error) {
+	res, executeErr := h.dumpConntrackTableByZone(table, zone)
+	return parseConntrackTableList(res, executeErr)
+}
+
+func parseConntrackTableList(res [][]byte, executeErr error) ([]*ConntrackFlow, error) {
 	if executeErr != nil && !errors.Is(executeErr, ErrDumpInterrupted) {
 		return nil, executeErr
 	}
@@ -234,6 +258,43 @@ func (h *Handle) newConntrackRequest(table ConntrackTableType, family InetFamily
 func (h *Handle) dumpConntrackTable(table ConntrackTableType, family InetFamily) ([][]byte, error) {
 	req := h.newConntrackRequest(table, family, nl.IPCTNL_MSG_CT_GET, unix.NLM_F_DUMP)
 	return req.Execute(unix.NETLINK_NETFILTER, 0)
+}
+
+func (h *Handle) newConntrackDumpRequestByZone(table ConntrackTableType, zone uint16) (*nl.NetlinkRequest, error) {
+	if table != ConntrackTable {
+		return nil, fmt.Errorf("conntrack zone filtering is unsupported for table type %d", table)
+	}
+
+	req := h.newConntrackRequest(table, unix.AF_UNSPEC, nl.IPCTNL_MSG_CT_GET, unix.NLM_F_DUMP)
+	req.AddData(nl.NewRtAttr(nl.CTA_ZONE, nl.BEUint16Attr(zone)))
+	return req, nil
+}
+
+func (h *Handle) dumpConntrackTableByZone(table ConntrackTableType, zone uint16) ([][]byte, error) {
+	req, err := h.newConntrackDumpRequestByZone(table, zone)
+	if err != nil {
+		return nil, err
+	}
+
+	res, err := req.Execute(unix.NETLINK_NETFILTER, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	// Kernel-side filtering of conntrack dumps by CTA_ZONE was added in Linux
+	// 6.8 (commit eff3c558bb7e). Older kernels accept the attribute but ignore
+	// it and return the full table. Filter the response in userspace as a
+	// compatibility fallback; on newer kernels this only rechecks the already
+	// filtered result. Distributions may also backport the kernel support, so
+	// checking the response avoids relying on a reported kernel version.
+	filtered := make([][]byte, 0, len(res))
+	for _, dataRaw := range res {
+		if parseRawData(dataRaw).Zone == zone {
+			filtered = append(filtered, dataRaw)
+		}
+	}
+
+	return filtered, nil
 }
 
 // ProtoInfo wraps an L4-protocol structure - roughly corresponds to the
