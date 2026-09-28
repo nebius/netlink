@@ -197,7 +197,7 @@ func (filter *Flower) encode(parent *nl.RtAttr) error {
 	if filter.SkipSw {
 		flags |= nl.TCA_CLS_FLAGS_SKIP_SW
 	}
-	parent.AddRtAttr(nl.TCA_FLOWER_FLAGS, htonl(flags))
+	parent.AddRtAttr(nl.TCA_FLOWER_FLAGS, nl.Uint32Attr(flags))
 
 	actionsAttr := parent.AddRtAttr(nl.TCA_FLOWER_ACT, nil)
 	if err := EncodeActions(actionsAttr, filter.Actions); err != nil {
@@ -257,8 +257,8 @@ func (filter *Flower) decode(data []syscall.NetlinkRouteAttr) error {
 			}
 		case nl.TCA_FLOWER_FLAGS:
 			attr := nl.DeserializeUint32Bitfield(datum.Value)
-			skipSw := attr.Value & nl.TCA_CLS_FLAGS_SKIP_HW
-			skipHw := attr.Value & nl.TCA_CLS_FLAGS_SKIP_SW
+			skipSw := attr.Value & nl.TCA_CLS_FLAGS_SKIP_SW
+			skipHw := attr.Value & nl.TCA_CLS_FLAGS_SKIP_HW
 			if skipSw != 0 {
 				filter.SkipSw = true
 			}
@@ -283,7 +283,7 @@ func (filter *Flower) decode(data []syscall.NetlinkRouteAttr) error {
 // FilterDel will delete a filter from the system.
 // Equivalent to: `tc filter del $filter`
 func FilterDel(filter Filter) error {
-	return pkgHandle.FilterDel(filter)
+	return pkgHandle().FilterDel(filter)
 }
 
 // FilterDel will delete a filter from the system.
@@ -295,7 +295,7 @@ func (h *Handle) FilterDel(filter Filter) error {
 // FilterAdd will add a filter to the system.
 // Equivalent to: `tc filter add $filter`
 func FilterAdd(filter Filter) error {
-	return pkgHandle.FilterAdd(filter)
+	return pkgHandle().FilterAdd(filter)
 }
 
 // FilterAdd will add a filter to the system.
@@ -307,7 +307,7 @@ func (h *Handle) FilterAdd(filter Filter) error {
 // FilterReplace will replace a filter.
 // Equivalent to: `tc filter replace $filter`
 func FilterReplace(filter Filter) error {
-	return pkgHandle.FilterReplace(filter)
+	return pkgHandle().FilterReplace(filter)
 }
 
 // FilterReplace will replace a filter.
@@ -349,7 +349,7 @@ func (h *Handle) filterModify(filter Filter, proto, flags int) error {
 		if native != networkOrder {
 			// Copy TcU32Sel.
 			cSel := *sel
-			keys := make([]nl.TcU32Key, cap(sel.Keys))
+			keys := make([]nl.TcU32Key, len(sel.Keys))
 			copy(keys, sel.Keys)
 			cSel.Keys = keys
 			sel = &cSel
@@ -457,7 +457,7 @@ func (h *Handle) filterModify(filter Filter, proto, flags int) error {
 // If the returned error is [ErrDumpInterrupted], results may be inconsistent
 // or incomplete.
 func FilterList(link Link, parent uint32) ([]Filter, error) {
-	return pkgHandle.FilterList(link, parent)
+	return pkgHandle().FilterList(link, parent)
 }
 
 // FilterList gets a list of filters in the system.
@@ -505,7 +505,8 @@ func (h *Handle) FilterList(link Link, parent uint32) ([]Filter, error) {
 		filterType := ""
 		detailed := false
 		for _, attr := range attrs {
-			switch attr.Attr.Type {
+			attrType := attr.Attr.Type & nl.NLA_TYPE_MASK
+			switch attrType {
 			case nl.TCA_KIND:
 				filterType = string(attr.Value[:len(attr.Value)-1])
 				switch filterType {

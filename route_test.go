@@ -5,7 +5,6 @@ package netlink
 
 import (
 	"net"
-	"os"
 	"runtime"
 	"strconv"
 	"testing"
@@ -17,8 +16,7 @@ import (
 )
 
 func TestRouteAddDel(t *testing.T) {
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 
 	// get loopback interface
 	link, err := LinkByName("lo")
@@ -154,9 +152,65 @@ func TestRouteAddDel(t *testing.T) {
 	}
 }
 
+func TestRouteUnreachableEmptyDst(t *testing.T) {
+	t.Cleanup(setUpNetlinkTest(t))
+
+	// Test adding unreachable/blackhole/prohibit routes with empty Dst.IP
+	// These route types don't need RTA_DST to be serialized
+	testCases := []struct {
+		name      string
+		routeType int
+	}{
+		{"unreachable", unix.RTN_UNREACHABLE},
+		{"blackhole", unix.RTN_BLACKHOLE},
+		{"prohibit", unix.RTN_PROHIBIT},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			route := &Route{
+				Table: 100,
+				Dst: &net.IPNet{
+					IP:   net.IP{},
+					Mask: net.IPMask{},
+				},
+				Priority: 100,
+				Type:     tc.routeType,
+				Scope:    unix.RT_SCOPE_UNIVERSE,
+				Family:   FAMILY_V4,
+			}
+
+			if err := RouteAdd(route); err != nil {
+				t.Fatalf("failed to add %s route with empty Dst.IP: %v", tc.name, err)
+			}
+
+			t.Cleanup(func() {
+				if err := RouteDel(route); err != nil {
+					t.Errorf("failed to delete route %s: %v", tc.name, err)
+				}
+			})
+
+			routes, err := RouteListFiltered(FAMILY_V4, &Route{Table: 100}, RT_FILTER_TABLE)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			found := false
+			for _, r := range routes {
+				if r.Type == tc.routeType {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("%s route not found after adding", tc.name)
+			}
+		})
+	}
+}
+
 func TestRoute6AddDel(t *testing.T) {
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 
 	// create dummy interface
 	// IPv6 route added to loopback interface will be unreachable
@@ -192,7 +246,7 @@ func TestRoute6AddDel(t *testing.T) {
 		IP:   net.ParseIP("2001:db8::0"),
 		Mask: net.CIDRMask(64, 128),
 	}
-	route := Route{LinkIndex: link.Attrs().Index, Dst: dst}
+	route := Route{LinkIndex: link.Attrs().Index, Dst: dst, Expires: 10}
 	if err := RouteAdd(&route); err != nil {
 		t.Fatal(err)
 	}
@@ -202,6 +256,25 @@ func TestRoute6AddDel(t *testing.T) {
 	}
 	if len(routes) != nroutes+1 {
 		t.Fatal("Route not added properly")
+	}
+
+	// route expiry is supported by kernel 4.4+
+	k, m, err := KernelVersion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k > 4 || (k == 4 && m > 4) {
+		foundExpires := false
+		for _, route := range routes {
+			if route.Dst.IP.Equal(dst.IP) {
+				if route.Expires > 0 && route.Expires <= 10 {
+					foundExpires = true
+				}
+			}
+		}
+		if !foundExpires {
+			t.Fatal("Route 'expires' not set")
+		}
 	}
 
 	dstIP := net.ParseIP("2001:db8::1")
@@ -332,8 +405,7 @@ func TestRoute6AddDel(t *testing.T) {
 }
 
 func TestRouteChange(t *testing.T) {
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 
 	// get loopback interface
 	link, err := LinkByName("lo")
@@ -398,8 +470,7 @@ func TestRouteChange(t *testing.T) {
 }
 
 func TestRouteReplace(t *testing.T) {
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 
 	// get loopback interface
 	link, err := LinkByName("lo")
@@ -459,8 +530,7 @@ func TestRouteReplace(t *testing.T) {
 }
 
 func TestRouteAppend(t *testing.T) {
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 
 	// get loopback interface
 	link, err := LinkByName("lo")
@@ -523,8 +593,7 @@ func TestRouteAppend(t *testing.T) {
 }
 
 func TestRouteAddIncomplete(t *testing.T) {
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 
 	// get loopback interface
 	link, err := LinkByName("lo")
@@ -562,8 +631,7 @@ func expectRouteUpdate(ch <-chan RouteUpdate, t, f uint16, dst net.IP) bool {
 }
 
 func TestRouteSubscribe(t *testing.T) {
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 
 	ch := make(chan RouteUpdate)
 	done := make(chan struct{})
@@ -607,8 +675,7 @@ func TestRouteSubscribe(t *testing.T) {
 }
 
 func TestRouteSubscribeWithOptions(t *testing.T) {
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 
 	ch := make(chan RouteUpdate)
 	done := make(chan struct{})
@@ -796,8 +863,7 @@ func TestRouteSubscribeListExisting(t *testing.T) {
 }
 
 func TestRouteFilterAllTables(t *testing.T) {
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 
 	// get loopback interface
 	link, err := LinkByName("lo")
@@ -877,8 +943,7 @@ func TestRouteFilterAllTables(t *testing.T) {
 }
 
 func TestRouteFilterByFamily(t *testing.T) {
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 
 	const table int = 999
 
@@ -950,8 +1015,7 @@ func TestRouteFilterByFamily(t *testing.T) {
 }
 
 func TestRouteFilterIterCanStop(t *testing.T) {
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 
 	// get loopback interface
 	link, err := LinkByName("lo")
@@ -1016,8 +1080,7 @@ func TestRouteFilterIterCanStop(t *testing.T) {
 }
 
 func BenchmarkRouteListFilteredNew(b *testing.B) {
-	tearDown := setUpNetlinkTest(b)
-	defer tearDown()
+	b.Cleanup(setUpNetlinkTest(b))
 
 	link, err := setUpRoutesBench(b)
 
@@ -1025,7 +1088,7 @@ func BenchmarkRouteListFilteredNew(b *testing.B) {
 	b.ReportAllocs()
 	var routes []Route
 	for i := 0; i < b.N; i++ {
-		routes, err = pkgHandle.RouteListFiltered(FAMILY_V4, &Route{
+		routes, err = RouteListFiltered(FAMILY_V4, &Route{
 			LinkIndex: link.Attrs().Index,
 		}, RT_FILTER_OIF)
 		if err != nil {
@@ -1039,8 +1102,7 @@ func BenchmarkRouteListFilteredNew(b *testing.B) {
 }
 
 func BenchmarkRouteListIter(b *testing.B) {
-	tearDown := setUpNetlinkTest(b)
-	defer tearDown()
+	b.Cleanup(setUpNetlinkTest(b))
 
 	link, err := setUpRoutesBench(b)
 
@@ -1104,8 +1166,7 @@ func tableIDIn(ids []int, id int) bool {
 }
 
 func TestRouteExtraFields(t *testing.T) {
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 
 	// get loopback interface
 	link, err := LinkByName("lo")
@@ -1180,8 +1241,7 @@ func TestRouteExtraFields(t *testing.T) {
 }
 
 func TestRouteMultiPath(t *testing.T) {
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 
 	// get loopback interface
 	link, err := LinkByName("lo")
@@ -1357,8 +1417,7 @@ func TestRouteIifOption(t *testing.T) {
 }
 
 func TestRouteOifOption(t *testing.T) {
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 
 	// setup two interfaces: eth0, eth1
 	err := LinkAdd(&Dummy{LinkAttrs{Name: "eth0"}})
@@ -1467,8 +1526,7 @@ func TestRouteOifOption(t *testing.T) {
 }
 
 func TestFilterDefaultRoute(t *testing.T) {
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 
 	// get loopback interface
 	link, err := LinkByName("lo")
@@ -1549,8 +1607,7 @@ func TestFilterDefaultRoute(t *testing.T) {
 }
 
 func TestMPLSRouteAddDel(t *testing.T) {
-	tearDown := setUpMPLSNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpMPLSNetlinkTest(t))
 
 	// get loopback interface
 	link, err := LinkByName("lo")
@@ -1601,8 +1658,7 @@ func TestIP6tnlRouteAddDel(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 
 	// get loopback interface
 	link, err := LinkByName("lo")
@@ -1921,6 +1977,9 @@ func TestSEG6LocalEqual(t *testing.T) {
 	var flags_end_dt6 [nl.SEG6_LOCAL_MAX]bool
 	flags_end_dt6[nl.SEG6_LOCAL_ACTION] = true
 	flags_end_dt6[nl.SEG6_LOCAL_TABLE] = true
+	var flags_end_dt46 [nl.SEG6_LOCAL_MAX]bool
+	flags_end_dt46[nl.SEG6_LOCAL_ACTION] = true
+	flags_end_dt46[nl.SEG6_LOCAL_VRFTABLE] = true
 	var flags_end_dt4 [nl.SEG6_LOCAL_MAX]bool
 	flags_end_dt4[nl.SEG6_LOCAL_ACTION] = true
 	flags_end_dt4[nl.SEG6_LOCAL_TABLE] = true
@@ -1975,6 +2034,11 @@ func TestSEG6LocalEqual(t *testing.T) {
 			Table:  40,
 		},
 		{
+			Flags:    flags_end_dt46,
+			Action:   nl.SEG6_LOCAL_ACTION_END_DT46,
+			VrfTable: 50,
+		},
+		{
 			Flags:    flags_end_b6,
 			Action:   nl.SEG6_LOCAL_ACTION_END_B6,
 			Segments: segs,
@@ -2008,19 +2072,26 @@ func TestSEG6LocalEqual(t *testing.T) {
 	}
 }
 func TestSEG6RouteAddDel(t *testing.T) {
-	if os.Getenv("CI") == "true" {
-		t.Skipf("Fails in CI with: route_test.go:*: Invalid Type. SEG6_IPTUN_MODE_INLINE routes not added properly")
-	}
-	// add/del routes with LWTUNNEL_SEG6 to/from loopback interface.
+	// add/del routes with LWTUNNEL_SEG6 to/from interface.
 	// Test both seg6 modes: encap (IPv4) & inline (IPv6).
-	tearDown := setUpSEG6NetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpSEG6NetlinkTest(t))
 
-	// get loopback interface and bring it up
-	link, err := LinkByName("lo")
+	// loopback doesn't work on recent kernels, so use a dummy
+	err := LinkAdd(&Dummy{LinkAttrs{Name: "dummy0"}})
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	link, err := LinkByName("dummy0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := LinkDel(link); err != nil {
+			t.Logf("failed to delete device: %v", err)
+		}
+	})
+
 	if err := LinkSetUp(link); err != nil {
 		t.Fatal(err)
 	}
@@ -2034,7 +2105,6 @@ func TestSEG6RouteAddDel(t *testing.T) {
 		Mask: net.CIDRMask(32, 32),
 	}
 	var s1, s2 []net.IP
-	s1 = append(s1, net.ParseIP("::")) // inline requires "::"
 	s1 = append(s1, net.ParseIP("fc00:a000::12"))
 	s1 = append(s1, net.ParseIP("fc00:a000::11"))
 	s2 = append(s2, net.ParseIP("fc00:a000::22"))
@@ -2054,7 +2124,9 @@ func TestSEG6RouteAddDel(t *testing.T) {
 		t.Fatal(err)
 	}
 	// SEG6_IPTUN_MODE_INLINE
-	routes, err := RouteList(link, FAMILY_V6)
+	// Kernel adds multiple routes so filter them
+	filtV6 := &Route{LinkIndex: link.Attrs().Index, Dst: dst1}
+	routes, err := RouteListFiltered(FAMILY_V6, filtV6, RT_FILTER_OIF|RT_FILTER_DST)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2067,7 +2139,9 @@ func TestSEG6RouteAddDel(t *testing.T) {
 		}
 	}
 	// SEG6_IPTUN_MODE_ENCAP
-	routes, err = RouteList(link, FAMILY_V4)
+	// Kernel adds multiple routes so filter them
+	filtV4 := &Route{LinkIndex: link.Attrs().Index, Dst: dst2}
+	routes, err = RouteListFiltered(FAMILY_V4, filtV4, RT_FILTER_OIF|RT_FILTER_DST)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2099,8 +2173,7 @@ func TestSEG6RouteAddDel(t *testing.T) {
 // add/del routes with LWTUNNEL_ENCAP_SEG6_LOCAL to/from dummy interface.
 func TestSEG6LocalRoute6AddDel(t *testing.T) {
 	minKernelRequired(t, 4, 14)
-	tearDown := setUpSEG6NetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpSEG6NetlinkTest(t))
 
 	// create dummy interface
 	// IPv6 route added to loopback interface will be unreachable
@@ -2230,8 +2303,7 @@ func TestMTURouteAddDel(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 
 	// get loopback interface
 	link, err := LinkByName("lo")
@@ -2284,8 +2356,7 @@ func TestMTULockRouteAddDel(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 
 	// get loopback interface
 	link, err := LinkByName("lo")
@@ -2342,8 +2413,7 @@ func TestRtoMinLockRouteAddDel(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 
 	// get loopback interface
 	link, err := LinkByName("lo")
@@ -2396,8 +2466,7 @@ func TestRtoMinLockRouteAddDel(t *testing.T) {
 
 func TestRouteViaAddDel(t *testing.T) {
 	minKernelRequired(t, 5, 4)
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 
 	_, err := RouteList(nil, FAMILY_V4)
 	if err != nil {
@@ -2460,9 +2529,103 @@ func TestRouteViaAddDel(t *testing.T) {
 	}
 }
 
+// TestRouteMultiPathViaIPv4Mapped verifies that adding a Multipath route
+// with a 16-byte IPv4-mapped address is correctly normalized to 4 bytes
+// during encoding, preventing kernel invalid gateway rejections.
+func TestRouteMultiPathViaIPv4Mapped(t *testing.T) {
+	minKernelRequired(t, 5, 4)
+	t.Cleanup(setUpNetlinkTest(t))
+
+	link, err := LinkByName("lo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := LinkSetUp(link); err != nil {
+		t.Fatal(err)
+	}
+
+	buggyViaIP := net.ParseIP("1.1.1.1")
+	if len(buggyViaIP) != 16 {
+		t.Fatalf("expected a 16-byte IP object for the test, but got %d bytes", len(buggyViaIP))
+	}
+
+	dst := &net.IPNet{
+		IP:   net.IPv4(192, 168, 99, 0),
+		Mask: net.CIDRMask(24, 32),
+	}
+
+	route := &Route{
+		LinkIndex: link.Attrs().Index,
+		Dst:       dst,
+		MultiPath: []*NexthopInfo{
+			{
+				LinkIndex: link.Attrs().Index,
+				Flags:     int(FLAG_ONLINK),
+				Via: &Via{
+					AddrFamily: FAMILY_V4,
+					Addr:       buggyViaIP, // intentionally trying to send the 16-byte IP to the Kernel
+				},
+			},
+		},
+	}
+
+	if err := RouteAdd(route); err != nil {
+		t.Fatalf("RouteAdd should handle 16-byte IPv4 Via addresses: %v", err)
+	}
+
+	routes, err := RouteListFiltered(FAMILY_V4, &Route{Dst: dst}, RT_FILTER_DST)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 {
+		t.Fatal("Route was not added to the kernel properly")
+	}
+
+	if err := RouteDel(route); err != nil {
+		t.Fatal(err)
+	}
+
+	routesAfterDel, err := RouteListFiltered(FAMILY_V4, &Route{Dst: dst}, RT_FILTER_DST)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routesAfterDel) != 0 {
+		t.Fatal("Route was not deleted from the kernel properly")
+	}
+}
+
+// TestViaEncodeIPv4Mapped verifies that a 16-byte IPv4-mapped address
+// is correctly compressed and encoded into a strictly 6-byte slice
+// (2 bytes for AddrFamily + 4 bytes for the IPv4 address).
+func TestViaEncodeIPv4Mapped(t *testing.T) {
+	via := &Via{
+		AddrFamily: FAMILY_V4,
+		Addr:       net.ParseIP("1.1.1.1"),
+	}
+
+	b, err := via.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(b) != 6 {
+		t.Fatalf("expected encoded Via length to be 6 bytes, got %d", len(b))
+	}
+
+	gotFamily := int(native.Uint16(b[0:2]))
+	if gotFamily != FAMILY_V4 {
+		t.Fatalf("unexpected address family; got %d, want %d", gotFamily, FAMILY_V4)
+	}
+
+	gotAddr := net.IP(b[2:6])
+	wantAddr := net.IPv4(1, 1, 1, 1)
+	if !gotAddr.Equal(wantAddr) {
+		t.Fatalf("unexpected IPv4 address; got %s, want %s", gotAddr, wantAddr)
+	}
+}
+
 func TestRouteUIDOption(t *testing.T) {
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 
 	// setup eth0 so that network is reachable
 	err := LinkAdd(&Dummy{LinkAttrs{Name: "eth0"}})
@@ -2557,8 +2720,7 @@ func TestRouteUIDOption(t *testing.T) {
 }
 
 func TestRouteFWMarkOption(t *testing.T) {
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 
 	// setup eth0 so that network is reachable
 	err := LinkAdd(&Dummy{LinkAttrs{Name: "eth0"}})
@@ -2702,8 +2864,7 @@ func TestRouteFWMarkOption(t *testing.T) {
 }
 
 func TestRouteGetFIBMatchOption(t *testing.T) {
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 
 	err := LinkAdd(&Dummy{LinkAttrs{Name: "eth0"}})
 	if err != nil {
@@ -2757,5 +2918,242 @@ func TestRouteGetFIBMatchOption(t *testing.T) {
 	flag := routes[0].ListFlags()[0]
 	if flag != "onlink" {
 		t.Fatalf("Unexpected flag %s returned", flag)
+	}
+}
+
+func TestRouteNHID(t *testing.T) {
+	t.Cleanup(setUpNetlinkTest(t))
+
+	// create dummy interface
+	if err := LinkAdd(&Dummy{LinkAttrs: LinkAttrs{Name: "dummy0"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// get dummy interface
+	link0, err := LinkByName("dummy0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// bring the interface up
+	if err = LinkSetUp(link0); err != nil {
+		t.Fatal(err)
+	}
+
+	// add a new IPv6 link-local nexthop
+	nh := &Nexthop{
+		ID:      1,
+		OIF:     uint32(link0.Attrs().Index),
+		Gateway: net.ParseIP("fe80::1"),
+	}
+	if err = NexthopAdd(nh); err != nil {
+		t.Fatal(err)
+	}
+
+	// IPv4 prefix with IPv6 link local nexthop
+	_, dst, err := net.ParseCIDR("10.0.0.0/24")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	route := Route{
+		Dst:  dst,
+		NHID: nh.ID,
+	}
+	if err = RouteAdd(&route); err != nil {
+		t.Fatal(err)
+	}
+
+	// Ensure we can retrieve the route we just added
+	routes, err := RouteListFiltered(FAMILY_V4, &Route{Dst: dst}, RT_FILTER_DST)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 1 {
+		t.Fatalf("Expected 1 route, got %d", len(routes))
+	}
+
+	if routes[0].NHID != nh.ID {
+		t.Fatalf("Expected route NHID %d, got %d", nh.ID, routes[0].NHID)
+	}
+}
+
+// findRtAttr returns the Data of the first top-level RtAttr of the given type
+// in req, failing the test if it is absent.
+func findRtAttr(t *testing.T, req *nl.NetlinkRequest, attrType uint16) []byte {
+	t.Helper()
+	for _, d := range req.Data {
+		if attr, ok := d.(*nl.RtAttr); ok && attr.Type == attrType {
+			return attr.Data
+		}
+	}
+	t.Fatalf("attribute type %d not found in request", attrType)
+	return nil
+}
+
+// TestPrepareRouteReqV4MappedV6Gateway verifies that a v4-mapped IPv6 gateway
+// (::ffff:a.b.c.d) is encoded as a 16-byte AF_INET6 nexthop when the caller
+// opts in by setting route.Family to FAMILY_V6. As a net.IP the gateway is
+// byte-identical to its IPv4 form, so GetIPFamily reports FAMILY_V4; the
+// explicit family is what enables the V6 encoding. This does not need a live
+// netlink socket: prepareRouteReq only builds the request.
+func TestPrepareRouteReqV4MappedV6Gateway(t *testing.T) {
+	gw := net.ParseIP("::ffff:192.0.2.1")
+	_, v6dst, err := net.ParseCIDR("2001:db8::/64")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tt := range []struct {
+		name  string
+		route *Route
+	}{
+		{
+			name:  "explicit V6 family, no destination",
+			route: &Route{Family: FAMILY_V6, Gw: gw},
+		},
+		{
+			name:  "explicit V6 family with v6 destination",
+			route: &Route{Family: FAMILY_V6, Dst: v6dst, Gw: gw},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := nl.NewNetlinkRequest(unix.RTM_NEWROUTE, unix.NLM_F_CREATE|unix.NLM_F_EXCL|unix.NLM_F_ACK)
+			msg := nl.NewRtMsg()
+
+			if err := (&Handle{}).prepareRouteReq(tt.route, req, msg); err != nil {
+				t.Fatalf("prepareRouteReq: %v", err)
+			}
+
+			if msg.Family != unix.AF_INET6 {
+				t.Fatalf("msg.Family = %d, want AF_INET6 (%d)", msg.Family, unix.AF_INET6)
+			}
+
+			gwData := findRtAttr(t, req, unix.RTA_GATEWAY)
+			if len(gwData) != net.IPv6len {
+				t.Fatalf("RTA_GATEWAY length = %d, want %d", len(gwData), net.IPv6len)
+			}
+			if !net.IP(gwData).Equal(gw) {
+				t.Fatalf("RTA_GATEWAY = %v, want %v", net.IP(gwData), gw)
+			}
+		})
+	}
+}
+
+// TestPrepareRouteReqV4MappedV6GatewayMultiPath is the multipath analogue of
+// TestPrepareRouteReqV4MappedV6Gateway: a v4-mapped IPv6 gateway carried in a
+// MultiPath NexthopInfo must be encoded as a 16-byte AF_INET6 nexthop when the
+// caller opts in via route.Family, matching the direct Route.Gw behavior.
+func TestPrepareRouteReqV4MappedV6GatewayMultiPath(t *testing.T) {
+	gw := net.ParseIP("::ffff:192.0.2.1")
+	_, v6dst, err := net.ParseCIDR("2001:db8::/64")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	route := &Route{
+		Family: FAMILY_V6,
+		Dst:    v6dst,
+		MultiPath: []*NexthopInfo{
+			{LinkIndex: 1, Gw: gw},
+		},
+	}
+
+	req := nl.NewNetlinkRequest(unix.RTM_NEWROUTE, unix.NLM_F_CREATE|unix.NLM_F_EXCL|unix.NLM_F_ACK)
+	msg := nl.NewRtMsg()
+
+	if err := (&Handle{}).prepareRouteReq(route, req, msg); err != nil {
+		t.Fatalf("prepareRouteReq: %v", err)
+	}
+
+	if msg.Family != unix.AF_INET6 {
+		t.Fatalf("msg.Family = %d, want AF_INET6 (%d)", msg.Family, unix.AF_INET6)
+	}
+
+	// Descend into the nested RTA_MULTIPATH -> RtNexthop -> RTA_GATEWAY.
+	mp := findRtAttr(t, req, unix.RTA_MULTIPATH)
+	if len(mp) < unix.SizeofRtNexthop {
+		t.Fatalf("RTA_MULTIPATH too short: %d bytes", len(mp))
+	}
+	nh := nl.DeserializeRtNexthop(mp)
+	attrs, err := nl.ParseRouteAttr(mp[unix.SizeofRtNexthop:int(nh.RtNexthop.Len)])
+	if err != nil {
+		t.Fatalf("ParseRouteAttr: %v", err)
+	}
+	var gwData []byte
+	for _, attr := range attrs {
+		if attr.Attr.Type == unix.RTA_GATEWAY {
+			gwData = attr.Value
+		}
+	}
+	if gwData == nil {
+		t.Fatal("RTA_GATEWAY not found in multipath nexthop")
+	}
+	if len(gwData) != net.IPv6len {
+		t.Fatalf("RTA_GATEWAY length = %d, want %d", len(gwData), net.IPv6len)
+	}
+	if !net.IP(gwData).Equal(gw) {
+		t.Fatalf("RTA_GATEWAY = %v, want %v", net.IP(gwData), gw)
+	}
+}
+
+// TestPrepareRouteReqV4MappedV6GatewayRequiresFamily verifies that the conform
+// is opt-in: without an explicit route.Family, a v4-mapped gateway even
+// alongside a V6 destination is treated as FAMILY_V4 and rejected, exactly as
+// it was before v4-mapped nexthops were supported.
+func TestPrepareRouteReqV4MappedV6GatewayRequiresFamily(t *testing.T) {
+	_, dst, err := net.ParseCIDR("2001:db8::/64")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := nl.NewNetlinkRequest(unix.RTM_NEWROUTE, unix.NLM_F_CREATE|unix.NLM_F_EXCL|unix.NLM_F_ACK)
+	msg := nl.NewRtMsg()
+
+	route := &Route{Dst: dst, Gw: net.ParseIP("::ffff:192.0.2.1")}
+	if err := (&Handle{}).prepareRouteReq(route, req, msg); err == nil {
+		t.Fatal("expected an error for a v4-mapped gateway without Family set, got nil")
+	}
+}
+
+// TestPrepareRouteReqV4GatewayUnaffected guards against regressing the common
+// case: a plain IPv4 gateway must still be encoded as a 4-byte AF_INET nexthop.
+func TestPrepareRouteReqV4GatewayUnaffected(t *testing.T) {
+	_, dst, err := net.ParseCIDR("192.0.2.0/24")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw := net.ParseIP("192.0.2.1")
+
+	req := nl.NewNetlinkRequest(unix.RTM_NEWROUTE, unix.NLM_F_CREATE|unix.NLM_F_EXCL|unix.NLM_F_ACK)
+	msg := nl.NewRtMsg()
+
+	if err := (&Handle{}).prepareRouteReq(&Route{Dst: dst, Gw: gw}, req, msg); err != nil {
+		t.Fatalf("prepareRouteReq: %v", err)
+	}
+
+	if msg.Family != unix.AF_INET {
+		t.Fatalf("msg.Family = %d, want AF_INET (%d)", msg.Family, unix.AF_INET)
+	}
+
+	gwData := findRtAttr(t, req, unix.RTA_GATEWAY)
+	if len(gwData) != net.IPv4len {
+		t.Fatalf("RTA_GATEWAY length = %d, want %d", len(gwData), net.IPv4len)
+	}
+}
+
+// TestPrepareRouteReqExplicitV4GatewayOnV6Route verifies that even with an
+// explicit V6 family, a 4-byte IPv4 gateway is not conformed to V6: the conform
+// requires a 16-byte slice, so a deliberately 4-byte address ("I really meant
+// IPv4") still errors rather than being silently reinterpreted as a mapped
+// nexthop.
+func TestPrepareRouteReqExplicitV4GatewayOnV6Route(t *testing.T) {
+	gw := net.ParseIP("192.0.2.1").To4() // explicit 4-byte IPv4
+
+	req := nl.NewNetlinkRequest(unix.RTM_NEWROUTE, unix.NLM_F_CREATE|unix.NLM_F_EXCL|unix.NLM_F_ACK)
+	msg := nl.NewRtMsg()
+
+	if err := (&Handle{}).prepareRouteReq(&Route{Family: FAMILY_V6, Gw: gw}, req, msg); err == nil {
+		t.Fatal("expected an error for a 4-byte IPv4 gateway on a V6 route, got nil")
 	}
 }

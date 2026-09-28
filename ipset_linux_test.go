@@ -2,13 +2,66 @@ package netlink
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"net"
 	"os"
+	"syscall"
 	"testing"
 
 	"github.com/vishvananda/netlink/nl"
 	"golang.org/x/sys/unix"
 )
+
+func TestIpsetError(t *testing.T) {
+	ordinaryErr := errors.New("ordinary error")
+	privateErrno := syscall.Errno(nl.IPSET_ERR_EXIST)
+	wrappedErrno := fmt.Errorf("extended acknowledgment: %w", privateErrno)
+
+	tests := []struct {
+		name string
+		err  error
+		want error
+	}{
+		{name: "nil", err: nil, want: nil},
+		{name: "ordinary errno", err: syscall.EINVAL, want: syscall.EINVAL},
+		{name: "private ipset errno", err: privateErrno, want: nl.IPSetError(privateErrno)},
+		{name: "ordinary error", err: ordinaryErr, want: ordinaryErr},
+		{name: "wrapped private errno", err: wrappedErrno, want: wrappedErrno},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ipsetError(tt.err); got != tt.want {
+				t.Fatalf("ipsetError(%v) = %v; want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIpsetExecuteReturnsNonErrno(t *testing.T) {
+	sock, err := nl.Subscribe(unix.NETLINK_NETFILTER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sock.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	req := nl.NewNetlinkRequest(0, 0)
+	req.Sockets = map[int]*nl.SocketHandle{
+		unix.NETLINK_NETFILTER: {Socket: sock},
+	}
+
+	_, err = ipsetExecute(req)
+	if err == nil {
+		t.Fatal("expected closed socket error")
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		t.Fatalf("expected non-errno error, got %T: %v", err, err)
+	}
+}
 
 func TestParseIpsetProtocolResult(t *testing.T) {
 	msgBytes, err := os.ReadFile("testdata/ipset_protocol_result")
@@ -88,8 +141,7 @@ func TestParseIpsetListResult(t *testing.T) {
 }
 
 func TestIpsetCreateListAddDelDestroy(t *testing.T) {
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 	timeout := uint32(3)
 	err := IpsetCreate("my-test-ipset-1", "hash:ip", IpsetCreateOptions{
 		Replace:  true,
@@ -440,12 +492,26 @@ func TestIpsetCreateListAddDelDestroyWithTestCases(t *testing.T) {
 				Replace: false,
 			},
 		},
+		{
+			desc:     "Type-bitmap:port",
+			setname:  "my-test-ipset-bitmap-port",
+			typename: "bitmap:port",
+			options: IpsetCreateOptions{
+				Replace:  true,
+				Timeout:  &timeout,
+				PortFrom: 0,
+				PortTo:   1024,
+			},
+			entry: &IPSetEntry{
+				Port:    &port,
+				Replace: false,
+			},
+		},
 	}
 
 	for _, tC := range testCases {
 		t.Run(tC.desc, func(t *testing.T) {
-			tearDown := setUpNetlinkTest(t)
-			defer tearDown()
+			t.Cleanup(setUpNetlinkTest(t))
 
 			err := IpsetCreate(tC.setname, tC.typename, tC.options)
 			if err != nil {
@@ -519,11 +585,14 @@ func TestIpsetCreateListAddDelDestroyWithTestCases(t *testing.T) {
 			}
 
 			if tC.entry.Port != nil {
-				if *result.Entries[0].Protocol != *tC.entry.Protocol {
-					t.Fatalf("expected protocol to be '%d', got '%d'", *tC.entry.Protocol, *result.Entries[0].Protocol)
-				}
 				if *result.Entries[0].Port != *tC.entry.Port {
 					t.Fatalf("expected port to be '%d', got '%d'", *tC.entry.Port, *result.Entries[0].Port)
+				}
+			}
+
+			if tC.entry.Protocol != nil {
+				if result.Entries[0].Protocol == nil || *result.Entries[0].Protocol != *tC.entry.Protocol {
+					t.Fatalf("expected protocol to be '%d', got '%v'", *tC.entry.Protocol, result.Entries[0].Protocol)
 				}
 			}
 
@@ -615,8 +684,7 @@ func TestIpsetBitmapCreateListWithTestCases(t *testing.T) {
 
 	for _, tC := range testCases {
 		t.Run(tC.desc, func(t *testing.T) {
-			tearDown := setUpNetlinkTest(t)
-			defer tearDown()
+			t.Cleanup(setUpNetlinkTest(t))
 
 			err := IpsetCreate(tC.setname, tC.typename, tC.options)
 			if err != nil {
@@ -643,8 +711,7 @@ func TestIpsetBitmapCreateListWithTestCases(t *testing.T) {
 }
 
 func TestIpsetSwap(t *testing.T) {
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 
 	ipset1 := "my-test-ipset-swap-1"
 	ipset2 := "my-test-ipset-swap-2"
@@ -723,8 +790,7 @@ func nextIP(ip net.IP) {
 // TestIpsetMaxElements tests that we can create an ipset containing
 // 128k elements, which is double the default size (64k elements).
 func TestIpsetMaxElements(t *testing.T) {
-	tearDown := setUpNetlinkTest(t)
-	defer tearDown()
+	t.Cleanup(setUpNetlinkTest(t))
 
 	ipsetName := "my-test-ipset-max"
 	maxElements := uint32(128 << 10)
